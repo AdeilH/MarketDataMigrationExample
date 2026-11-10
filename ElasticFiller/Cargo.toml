@@ -1,0 +1,13 @@
+[package]
+name = "elastic-filler"
+version = "0.1.0"
+edition = "2021"
+description = "Build the XDP symbol index table from a directory of .pcap.zst captures, in parallel."
+
+[dependencies]
+# The parser lives on GitHub; Cargo.lock pins the resolved commit, and
+# `cargo update -p pcap-parser` picks up new upstream work.
+pcap-parser = { git = "https://github.com/AdeilH/CustomPCAPParser" }
+
+[profile.release]
+debug = true

@@ -1,0 +1,10 @@
+[package]
+name = "click-filler"
+version = "0.1.0"
+edition = "2021"
+description = "Move the XDP message index from Elasticsearch into ClickHouse, one resumable pass."
+
+[dependencies]
+
+[profile.release]
+debug = true

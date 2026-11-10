@@ -1,0 +1,102 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: elastic-filler-redis
+    ports:
+      - "6379:6379"
+    # Append-only persistence: the symbol table survives container/host
+    # restarts, so a populate run stays valid across the week.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.2.2
+    container_name: elastic-filler-es
+    environment:
+      # Single-node dev cluster: no discovery, no TLS on the loopback
+      # publish, auth via the built-in `elastic` user. `elastic-admin` and
+      # `kibana_system`'s password are set by the one-shot `setup` service.
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=false
+      - ELASTIC_PASSWORD=elastic-password
+      - ES_JAVA_OPTS=-Xms2g -Xmx2g
+    ports:
+      - "9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -u elastic:elastic-password http://localhost:9200/_cluster/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  # One-shot: creates the tool's login user and arms the built-in
+  # kibana_system service account (idempotent PUTs — rerunning
+  # `compose up` just overwrites the same definitions).
+  setup:
+    image: curlimages/curl:latest
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: "no"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        curl -s -u elastic:elastic-password -X PUT \
+          http://elasticsearch:9200/_security/user/elastic-admin \
+          -H 'Content-Type: application/json' \
+          -d '{"password":"elastic-password","roles":["superuser"]}' && \
+        curl -s -u elastic:elastic-password -X PUT \
+          http://elasticsearch:9200/_security/user/kibana_system/_password \
+          -H 'Content-Type: application/json' \
+          -d '{"password":"elastic-password"}' && \
+        echo "elastic-admin + kibana_system ready"
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:9.2.2
+    container_name: elastic-filler-kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      # Kibana MUST connect as kibana_system: the .kibana* index namespace
+      # is "restricted" in Elasticsearch — creating those indices is
+      # refused even to superusers, so migrations 403-loop forever
+      # otherwise (seen live: HTTP 403 on every CREATE_NEW_TARGET).
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=elastic-password
+      # Stable encryption keys — without these the encrypted-saved-objects
+      # plugin blocks plugin readiness (random per-boot keys also invalidate
+      # sessions on every restart).
+      - XPACK_SECURITY_ENCRYPTIONKEY=2708c34480125c3a94c234ba1e62287762ae9a367f06f6731b790cc59693988e
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=ae01d35647ef1c7c373d3be753b82760d8b6d8f0ff6edd2b29690d549a6cead1
+      - XPACK_REPORTING_ENCRYPTIONKEY=c14b37f25e9f6cb397337fbc31a9fd9901d4755be45fc3d0b0d325008180c9c9
+      # Dev stack: skip the SIEM/Fleet/ML plugin fleet entirely — leaner
+      # boot, faster readiness, fewer migration surfaces.
+      - XPACK_SECURITYSOLUTION_ENABLED=false
+      - XPACK_FLEET_ENABLED=false
+      - XPACK_OSQUERY_ENABLED=false
+      - XPACK_SYNTHETICS_ENABLED=false
+      - XPACK_UPTIME_ENABLED=false
+      - XPACK_ML_ENABLED=false
+      - XPACK_APM_ENABLED=false
+      - XPACK_REPORTING_ENABLED=false
+      - XPACK_CANVAS_ENABLED=false
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      setup:
+        condition: service_completed_successfully
+
+volumes:
+  redis-data:
+  es-data:
