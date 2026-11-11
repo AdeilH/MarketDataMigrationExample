@@ -96,6 +96,10 @@ const MAX_RANGES: usize = 128;
 const DEFAULT_WORKERS: usize = 8;
 const FETCH_PAGE_DEFAULT: usize = 10_000;
 const REPORT_SECS_DEFAULT: u64 = 1;
+/// Per-request I/O timeout: generous enough for a 10k-document page on a
+/// loaded cluster (a stalled fetch retries with backoff past it — the ES
+/// read path is idempotent).
+const TIMEOUT_DEFAULT: u64 = 60;
 
 /// What a run should do.
 #[derive(Clone, Copy)]
@@ -126,6 +130,8 @@ struct Config {
     fetch_page: usize,
     insert_batch: usize,
     report_secs: u64,
+    /// Per-request server I/O timeout in seconds (`--timeout`).
+    timeout: u64,
     checkpoint: PathBuf,
     /// `--limit N`: stop after N documents total (cumulative across
     /// resumes). The checkpoint stays on disk — `--resume` continues.
@@ -155,11 +161,19 @@ impl Default for Config {
             fetch_page: FETCH_PAGE_DEFAULT,
             insert_batch: INSERT_BATCH_DEFAULT,
             report_secs: REPORT_SECS_DEFAULT,
+            timeout: TIMEOUT_DEFAULT,
             checkpoint: CHECKPOINT_DEFAULT.into(),
             limit: None,
             resume: false,
             mode: Mode::Transfer,
         }
+    }
+}
+
+impl Config {
+    /// The per-request I/O timeout, as a `Duration` for the HTTP clients.
+    fn timeout_dur(&self) -> Duration {
+        Duration::from_secs(self.timeout)
     }
 }
 
@@ -186,6 +200,8 @@ throughput:
   --fetch-page N     documents per ES search (default 10000)
   --insert-batch N   rows per CH insert      (default 100000)
   --report-secs N    seconds between progress lines (default 1)
+  --timeout N        seconds per request before a retry (default 60;
+                     ES page fetches retry 3x with 2s/10s/30s backoff)
 
 state:
   --checkpoint FILE  walk-position file      (default clickfiller-checkpoint.json)
@@ -246,6 +262,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
             "--report-secs" => {
                 cfg.report_secs = value()?.parse().map_err(|_| "--report-secs wants a number")?
             }
+            "--timeout" => cfg.timeout = value()?.parse().map_err(|_| "--timeout wants a number")?,
             "--checkpoint" => cfg.checkpoint = value()?.into(),
             "--limit" => cfg.limit = Some(value()?.parse().map_err(|_| "--limit wants a number")?),
             "--resume" => cfg.resume = true,
@@ -270,19 +287,28 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
 
 /// Connect to both sides with operator-friendly failure messages.
 fn connect(cfg: &Config) -> Result<(Es, ClickHouse), String> {
-    let es = Es::connect(&cfg.es_host, cfg.es_port, &cfg.es_index, &cfg.es_user, &cfg.es_pass)
-        .map_err(|e| {
-            format!(
-                "cannot reach elasticsearch at {}:{}: {e} — is the stack up? (`cd ../ElasticFiller && docker compose up -d`)",
-                cfg.es_host, cfg.es_port
-            )
-        })?;
-    let ch = ClickHouse::connect(&cfg.ch_host, cfg.ch_port, &cfg.ch_user, &cfg.ch_pass).map_err(|e| {
+    let timeout = Duration::from_secs(cfg.timeout);
+    let es = Es::connect(
+        &cfg.es_host,
+        cfg.es_port,
+        &cfg.es_index,
+        &cfg.es_user,
+        &cfg.es_pass,
+        timeout,
+    )
+    .map_err(|e| {
         format!(
-            "cannot reach clickhouse at {}:{}: {e} — is the server up?",
-            cfg.ch_host, cfg.ch_port
+            "cannot reach elasticsearch at {}:{}: {e} — is the stack up? (`cd ../ElasticFiller && docker compose up -d`)",
+            cfg.es_host, cfg.es_port
         )
     })?;
+    let ch = ClickHouse::connect(&cfg.ch_host, cfg.ch_port, &cfg.ch_user, &cfg.ch_pass, timeout)
+        .map_err(|e| {
+            format!(
+                "cannot reach clickhouse at {}:{}: {e} — is the container up? (`make up`)",
+                cfg.ch_host, cfg.ch_port
+            )
+        })?;
     Ok((es, ch))
 }
 
@@ -747,9 +773,10 @@ fn worker_loop(
     stats: &Stats,
     ckpt: &Mutex<Checkpoint>,
 ) -> Result<(), String> {
-    let mut es = Es::connect(&es_creds.0, es_creds.1, &es_creds.2, &es_creds.3, &es_creds.4)
-        .map_err(|e| format!("worker {w}: {e}"))?;
-    let mut ch = ClickHouse::connect(&ch_creds.0, ch_creds.1, &ch_creds.2, &ch_creds.3)
+    let mut es =
+        Es::connect(&es_creds.0, es_creds.1, &es_creds.2, &es_creds.3, &es_creds.4, cfg.timeout_dur())
+            .map_err(|e| format!("worker {w}: {e}"))?;
+    let mut ch = ClickHouse::connect(&ch_creds.0, ch_creds.1, &ch_creds.2, &ch_creds.3, cfg.timeout_dur())
         .map_err(|e| format!("worker {w}: {e}"))?;
 
     // Drain the queue until it is empty or another worker's error/limit
@@ -814,7 +841,12 @@ fn walk_range(
         };
         stats.fetch_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::SeqCst);
         if !range_reported {
-            stats.total.fetch_add(page.total, Ordering::SeqCst);
+            // Only fresh-range first pages carry an exact total (resume
+            // seeks skip the full-traversal count; the ETA then leans on
+            // the histogram estimate).
+            if let Some(total) = page.total {
+                stats.total.fetch_add(total, Ordering::SeqCst);
+            }
             range_reported = true;
         }
         if page.hits.is_empty() {

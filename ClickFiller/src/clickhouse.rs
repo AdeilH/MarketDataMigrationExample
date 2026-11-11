@@ -9,6 +9,7 @@
 
 use crate::http::{percent_encode, Http};
 use crate::schema;
+use std::time::Duration;
 
 /// A connected ClickHouse session with credentials baked in.
 pub struct ClickHouse {
@@ -31,13 +32,19 @@ const INSERT_SETTINGS: &str = "date_time_input_format=best_effort\
      &input_format_skip_unknown_fields=1";
 
 impl ClickHouse {
-    pub fn connect(host: &str, port: u16, user: &str, password: &str) -> std::io::Result<Self> {
+    pub fn connect(
+        host: &str,
+        port: u16,
+        user: &str,
+        password: &str,
+        timeout: Duration,
+    ) -> std::io::Result<Self> {
         let mut headers = vec![("X-ClickHouse-User".to_string(), user.to_string())];
         if !password.is_empty() {
             headers.push(("X-ClickHouse-Key".to_string(), password.to_string()));
         }
         Ok(ClickHouse {
-            http: Http::connect(host, port, headers)?,
+            http: Http::connect(host, port, headers, timeout)?,
         })
     }
 
@@ -107,12 +114,12 @@ impl ClickHouse {
         }
     }
 
-    /// `(row count, oldest ts, newest ts)` for `--verify`. Empty table ->
-    /// `(0, None, None)`.
+    /// `(row count, oldest ts, newest ts)` for `--verify`. The count goes
+    /// through `FINAL` so pending ReplacingMergeTree duplicates (from a
+    /// resume that refetched boundaries) don't inflate it against
+    /// Elasticsearch. Empty table -> `(0, None, None)`.
     pub fn stats(&mut self, table: &str) -> Result<(u64, Option<String>, Option<String>), String> {
-        let query = format!(
-            "SELECT count(), min(ts), max(ts) FROM {table} FORMAT TSV"
-        );
+        let query = format!("SELECT count(), min(ts), max(ts) FROM {table} FINAL FORMAT TSV");
         let body = self.exec(&query)?;
         let mut fields = body.trim_end_matches('\n').split('\t');
         let count = fields

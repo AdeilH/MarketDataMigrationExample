@@ -15,6 +15,7 @@
 #   RANGES       time ranges (0 = auto ~4M docs) (default 0)
 #   INSERT_BATCH rows per ClickHouse insert      (default 100000)
 #   FETCH_PAGE   documents per ES search         (default 10000)
+#   TIMEOUT      seconds per request before retry (default 60)
 #   ES_INDEX     elasticsearch index             (default xdp-messages)
 #   TABLE        clickhouse table                (default xdp_messages)
 
@@ -27,6 +28,7 @@ WORKERS      ?= 8
 RANGES       ?= 0
 INSERT_BATCH ?= 100000
 FETCH_PAGE   ?= 10000
+TIMEOUT      ?= 60
 ES_AUTH      := -u elastic-admin:elastic-password
 CH_PORT      ?= 8124
 CH_PASS      ?= clickhouse-password
@@ -36,6 +38,7 @@ CH_AUTH      := -u default:$(CH_PASS)
 FLAGS := --es-index $(ES_INDEX) --ch-table $(TABLE) \
          --workers $(WORKERS) --ranges $(RANGES) \
          --insert-batch $(INSERT_BATCH) --fetch-page $(FETCH_PAGE) \
+         --timeout $(TIMEOUT) \
          --ch-port $(CH_PORT) --ch-pass $(CH_PASS)
 
 .DEFAULT_GOAL := transfer
@@ -86,9 +89,13 @@ metrics: ## server-side metrics: docs, size, rows, range, disk, parts
 	@printf '   disk     '; \
 		curl -sfm 5 $(CH_AUTH) "$(CH)" --data-binary \
 			"SELECT ifNull(formatReadableSize(sum(bytes_on_disk)), '0 B') FROM system.parts WHERE database = currentDatabase() AND table = '$(TABLE)' AND active"; echo
+	@printf '   logical  '; \
+		curl -sfm 5 $(CH_AUTH) "$(CH)" --data-binary \
+			"SELECT ifNull(concat(formatReadableSize(sum(data_uncompressed_bytes)), ' uncompressed · ', round(sum(data_uncompressed_bytes) / greatest(sum(bytes_on_disk), 1), 1), 'x compression'), 'empty') FROM system.parts WHERE database = currentDatabase() AND table = '$(TABLE)' AND active"; echo
 	@printf '   parts    '; \
 		curl -sfm 5 $(CH_AUTH) "$(CH)" --data-binary \
-			"SELECT count() FROM system.parts WHERE database = currentDatabase() AND table = '$(TABLE)' AND active"; echo
+			"SELECT concat(toString(countIf(active)), ' active · ', toString(countIf(NOT active)), ' merging/awaiting cleanup') FROM system.parts WHERE database = currentDatabase() AND table = '$(TABLE)'" \
+			|| echo unreachable; echo
 	@echo "== run logs"
 	@ls -t runs/*.log 2>/dev/null | head -3 || echo "   (none yet — run make transfer)"
 

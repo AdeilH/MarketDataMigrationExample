@@ -6,11 +6,11 @@
 # Variables (make VAR=value ...):
 #   MAX_FILES  how many captures `messages` ingests (default 10)
 #   THREADS    worker count for `messages` (default: one per core)
-#   DATA       capture directory (default ../PcapParser/data)
+#   DATA       capture directory (default ./data)
 #   ES_INDEX   elasticsearch index name (default xdp-messages)
 
 BIN       := target/release/elastic-filler
-DATA      ?= ../PcapParser/data
+DATA      ?= data
 MAX_FILES ?= 10
 THREADS   ?=
 ES_INDEX  ?= xdp-messages
@@ -52,7 +52,7 @@ up: ## start the stack: redis + elasticsearch + kibana
 down: ## stop the stack (data volumes persist)
 	docker compose down
 
-data: ## download + extract the 242 sample captures into ../PcapParser/data (~3.9 GB)
+data: ## download + extract the 242 sample captures into ./data (~3.9 GB)
 	mkdir -p $(DATA)
 	@if test -e "$(DATA)/ny4-xase-pillar-a-20230822T000000.pcap.zst"; then \
 		echo "captures already present in $(DATA) — skipping download"; \
@@ -81,6 +81,28 @@ es-size: ## index size + biggest indices + node disk
 		'http://localhost:9200/_cat/indices?expand_wildcards=all&bytes=gb&s=store.size:desc&h=index,store.size,docs.count' | head -8
 	@echo "== node disk:"
 	@curl -s -u elastic-admin:elastic-password 'http://localhost:9200/_cat/allocation?v'
+
+# ClickHouse `SELECT active, count(), sum(bytes_on_disk) ... FROM system.parts
+# GROUP BY active` equivalent: shards = active rows, segments = parts.
+es-parts: ## system.parts-equivalent storage report for $(ES_INDEX)
+	@echo "active  parts  on_disk   docs"
+	@curl -s -u elastic-admin:elastic-password \
+		'http://localhost:9200/_cat/shards/$(ES_INDEX)?h=prirep,state' | \
+		awk '{printf "%-7s ", ($$1=="p" && $$2=="STARTED")?"true":"false"}'
+	@curl -s -u elastic-admin:elastic-password \
+		'http://localhost:9200/_cat/segments/$(ES_INDEX)?bytes=b&h=segment' | wc -l | awk '{printf "%-6d ", $$1}'
+	@curl -s -u elastic-admin:elastic-password \
+		'http://localhost:9200/_cat/segments/$(ES_INDEX)?bytes=b&h=size' | \
+		awk '{s+=$$1} END {printf "%-9.1fGiB ", s/2**30}'
+	@curl -s -u elastic-admin:elastic-password \
+		'http://localhost:9200/$(ES_INDEX)/_stats/docs' | \
+		python3 -c "import json,sys; d=json.load(sys.stdin)['_all']['primaries']['docs']['count']; print(f'{d:,}')"
+	@echo "-- on-disk total (incl. not-in-segment metadata):"
+	@curl -s -u elastic-admin:elastic-password \
+		'http://localhost:9200/$(ES_INDEX)/_stats/store' | \
+		python3 -c "import json,sys; s=json.load(sys.stdin)['_all']['primaries']['store']['size_in_bytes']; print(f'   {s:,} bytes = {s/2**30:.1f} GiB')"
+	@echo "-- (no uncompressed equivalent: Lucene always stores compressed;"
+	@echo "--    per-field disk usage: GET $(ES_INDEX)/_disk_usage?run_expensive_tasks=true)"
 
 clean: ## remove build artifacts (redis volume is untouched)
 	cargo clean

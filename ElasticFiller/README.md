@@ -1,34 +1,42 @@
 # elastic-filler
 
-Populate the XDP symbol index table (`symbol_index -> symbol`) from a
-directory of `.pcap.zst` captures — in parallel — and optionally publish
-it to Redis as the pre-market warm-up.
+Replay NYSE American XDP market-data captures into Elasticsearch: the
+symbol table goes to Redis (pre-market warm-up), every other message
+becomes one linear, searchable document. Standalone project — the
+`pcap-parser` library is pulled from GitHub, captures live in `./data`.
+
+```
+.pcap.zst captures ──> elastic-filler ──┬─> Redis          (symbol index table)
+                                        └─> Elasticsearch  (xdp-messages)
+```
 
 The NYSE XDP feed references symbols by index in every subsequent message
 (AddOrder, Execution, ...), so a consumer must first collect the
-`SymbolIndexMapping` broadcasts. This tool runs that pass only: every
-capture is read, decompressed (zstd, via `pcap-parser`) and dissected on
-all cores, and the only events kept are the symbol mappings. Per-file
-tables are merged in the main thread in sorted file order (deterministic);
-a re-mapped index is warned about, not silently overwritten.
+`SymbolIndexMapping` broadcasts. Pass 1 does that: every capture is read,
+decompressed (zstd, via the `pcap-parser` library) and dissected on all
+cores; per-file tables are merged in sorted file order (deterministic);
+a re-mapped index is warned about, not silently overwritten. Pass 2
+replays everything else into Elasticsearch, enriched with the symbol
+names from Redis.
 
 ## Capture data
 
 The captures are Databento's free NYSE American XDP samples — pillar A+B
 channels, full trading day 2023-08-22: one **3.9 GB zip** holding the 242
-`.pcap.zst` files flat (10-minute rotations, 00:00–23:50 UTC):
+`.pcap.zst` files flat (10-minute rotations, 00:00–23:50 UTC). They
+extract into `./data` (gitignored):
 
 ```sh
-make data    # downloads + extracts into ../PcapParser/data, skips if present
+make data    # downloads + extracts into ./data, skips if already present
 ```
 
 or by hand:
 
 ```sh
-mkdir -p ../PcapParser/data
+mkdir -p data
 curl -fL -o /tmp/ny4-xase-pillar-ab-20230822.zip \
   https://sample-pcaps-dl.databento.com/xase/20230822/ny4-xase-pillar-ab-20230822.zip
-unzip -o /tmp/ny4-xase-pillar-ab-20230822.zip -d ../PcapParser/data
+unzip -o /tmp/ny4-xase-pillar-ab-20230822.zip -d data
 rm /tmp/ny4-xase-pillar-ab-20230822.zip
 ```
 
@@ -39,7 +47,7 @@ the sample data is governed by Databento's sample-data terms`.
 ## Usage
 
 ```sh
-cargo run --release                          # scan ../PcapParser/data, print table
+cargo run --release                          # scan ./data, print symbol table
 cargo run --release -- --threads 4           # cap the worker count
 cargo run --release -- <data-dir>            # scan another directory
 ```
@@ -59,15 +67,8 @@ scan begins. It is never fatal — the scan itself does not need Redis.
 
 ```sh
 make up                                             # redis + elasticsearch + kibana
-make symbols                                        # scan + upload (alias below)
+make symbols                                        # scan + upload
 docker compose exec redis redis-cli HLEN xdp:symbols
-```
-
-or the raw commands:
-
-```sh
-docker compose up -d                                # start the stack
-cargo run --release -- --populate-symbols           # scan + upload
 ```
 
 Flags: `--redis-host` (default `127.0.0.1`), `--redis-port` (default
@@ -101,7 +102,7 @@ fails its migrations with endless HTTP 403s.
 
 ## Message replay into Elasticsearch (`--store-messages`)
 
-The second pass, run before market after symbols are populated:
+The second pass, run after symbols are populated:
 
 ```sh
 cargo run --release -- --store-messages                    # whole directory
@@ -135,9 +136,9 @@ mappings for the filter fields (`symbol`, `msg_type`, `side`, `file`,
 is dynamically mapped.
 
 Watch the disk: documents are ~310 bytes as JSON but compress heavily in
-Lucene — the measured full-day footprint is **~11 GB for 200 of 242
-captures**, so a complete `messages-all` lands around **13–15 GB**.
-Scope with `--max-files` or a scoped directory if you want less.
+Lucene. Measured full day: **~150 M messages ≈ 21 GiB** in Elasticsearch
+for all 242 captures. Scope with `--max-files` or a scoped directory if
+you want less.
 
 Documents carry deterministic ids (`file:packet:n`), so **re-running the
 same captures overwrites instead of duplicating** — a run interrupted by
@@ -156,5 +157,7 @@ request whose connection died before a response) can simply be repeated.
 Depends on [`pcap-parser`](https://github.com/AdeilH/CustomPCAPParser)
 as a git dependency; no other external crates. Cargo.lock pins the
 upstream commit — `cargo update -p pcap-parser` picks up new parser
-work. The capture data still lives in `../PcapParser/data` (that folder
-is data, not code).
+work. Captures live in `./data` (gitignored, produced by `make data`).
+
+Next hop: [`../ClickFiller`](../ClickFiller) moves the finished index
+into ClickHouse for analysis.

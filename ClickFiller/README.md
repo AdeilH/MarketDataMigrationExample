@@ -125,6 +125,8 @@ throughput:   --workers W (8)        parallel range walkers
               --fetch-page N (10000) documents per ES search
               --insert-batch N (100000)  rows per CH insert
               --report-secs N (1)    seconds between progress lines
+              --timeout N (60)       seconds per request; ES page fetches
+                                     then retry 3x (2s/10s/30s backoff)
 state:        --checkpoint FILE      walk-position file
               --limit N              stop after N docs (checkpoint kept)
               --resume               continue from the checkpoint

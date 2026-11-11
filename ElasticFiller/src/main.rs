@@ -10,10 +10,7 @@
 //! This tool does exactly that pass, and nothing else: every `.zst` capture
 //! in a directory is decompressed and dissected in parallel (one scoped
 //! thread per worker, work handed out file-by-file through an atomic
-//! cursor), and the only events looked at are the symbol mappings. It is
-//! the cheap first pass of the full sequential replay in PcapParser's
-//! `main.rs` — the "populate symbols" step — turned into a standalone
-//! project.
+//! cursor), and the only events looked at are the symbol mappings.
 //!
 //! Usage:
 //!
@@ -25,13 +22,13 @@
 //!                [data-dir-or-file]
 //! ```
 //!
-//! The data directory defaults to `../PcapParser/data` (the captures used
-//! by the parent project). Files are processed by all cores; each worker
-//! owns its own feed parser (parsers are stateful). Every file builds its
-//! own symbol map, and the maps are merged in the main thread in sorted
-//! file order — deterministic across runs, unlike worker completion order.
-//! A re-mapping of an index to a different symbol is reported as a
-//! conflict rather than silently overwritten.
+//! The data directory defaults to `./data` (where `make data` downloads
+//! and extracts the Databento samples). Files are processed by all cores;
+//! each worker owns its own feed parser (parsers are stateful). Every file
+//! builds its own symbol map, and the maps are merged in the main thread
+//! in sorted file order — deterministic across runs, unlike worker
+//! completion order. A re-mapping of an index to a different symbol is
+//! reported as a conflict rather than silently overwritten.
 //!
 //! With `--populate-symbols` (the pre-market warm-up run) the merged table
 //! is uploaded to Redis instead of printed: the staging hash
@@ -628,7 +625,7 @@ fn collect_zst(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 fn main() -> ExitCode {
     // args: [--populate-symbols] [--threads N] [--redis-host H]
     //       [--redis-port P] [data-dir]
-    let mut data_dir = "../PcapParser/data".to_string();
+    let mut data_dir = "data".to_string();
     let mut threads_override = None;
     let mut populate = false;
     let mut store = false;

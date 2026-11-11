@@ -28,6 +28,8 @@ pub struct Http {
     headers: Vec<(String, String)>,
     /// Saved so a dead connection can be transparently re-established.
     addr: (String, u16),
+    /// Reapplied on every reconnect.
+    timeout: Duration,
 }
 
 /// Why an attempt failed. `Dead` = the connection broke before a response
@@ -44,11 +46,18 @@ enum Fail {
 
 impl Http {
     /// Connect to `host:port` with `headers` sent on every request.
-    /// 30 s I/O timeouts: a page fetch or a multi-megabyte insert can
-    /// legitimately take a moment, but a hung server must not stall a
-    /// transfer run forever.
-    pub fn connect(host: &str, port: u16, headers: Vec<(String, String)>) -> std::io::Result<Self> {
-        let writer = Self::dial(host, port)?;
+    /// `timeout` bounds each request's I/O (read and write): a page
+    /// fetch or a multi-megabyte insert can legitimately take a moment,
+    /// but a hung server must not stall a transfer run forever — and the
+    /// callers ride out the timeout with retries where the request is
+    /// idempotent.
+    pub fn connect(
+        host: &str,
+        port: u16,
+        headers: Vec<(String, String)>,
+        timeout: Duration,
+    ) -> std::io::Result<Self> {
+        let writer = Self::dial(host, port, timeout)?;
         let reader = BufReader::new(writer.try_clone()?);
         Ok(Http {
             writer,
@@ -56,20 +65,21 @@ impl Http {
             host_header: format!("{host}:{port}"),
             headers,
             addr: (host.to_string(), port),
+            timeout,
         })
     }
 
     /// Fresh TCP connection with the standard timeouts.
-    fn dial(host: &str, port: u16) -> std::io::Result<TcpStream> {
+    fn dial(host: &str, port: u16, timeout: Duration) -> std::io::Result<TcpStream> {
         let stream = TcpStream::connect((host, port))?;
         stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
         Ok(stream)
     }
 
     fn reconnect(&mut self) -> Result<(), String> {
-        let writer = Self::dial(&self.addr.0, self.addr.1)
+        let writer = Self::dial(&self.addr.0, self.addr.1, self.timeout)
             .map_err(|e| format!("reconnect to {}:{} failed: {e}", self.addr.0, self.addr.1))?;
         let reader = BufReader::new(
             writer

@@ -23,6 +23,8 @@
 
 use crate::http::{base64, percent_encode, Http};
 use crate::json::{self, Json};
+use std::thread;
+use std::time::Duration;
 
 /// A connected Elasticsearch session with basic-auth credentials baked in.
 pub struct Es {
@@ -44,20 +46,26 @@ pub struct Hit {
 
 /// One page of the PIT walk.
 pub struct Page {
-    /// Total documents in the PIT (exact, `track_total_hits`).
-    pub total: u64,
+    /// Exact total, present only when the page asked for it (the first
+    /// page of a fresh range — exact counting forces Elasticsearch to
+    /// traverse the whole range, so no other page pays for it).
+    pub total: Option<u64>,
     pub hits: Vec<Hit>,
 }
 
 impl Es {
     /// Connect to `host:port` as `user:password` (anonymous when both are
-    /// empty) and remember which index the transfer reads.
+    /// empty) and remember which index the transfer reads. `timeout` is
+    /// the per-request I/O timeout (a page of 10k documents on a loaded
+    /// cluster can legitimately take a while — see the retry schedule
+    /// below for what happens past it).
     pub fn connect(
         host: &str,
         port: u16,
         index: &str,
         user: &str,
         password: &str,
+        timeout: Duration,
     ) -> std::io::Result<Self> {
         let mut headers = Vec::new();
         if !user.is_empty() || !password.is_empty() {
@@ -65,7 +73,7 @@ impl Es {
             headers.push(("Authorization".to_string(), format!("Basic {encoded}")));
         }
         Ok(Es {
-            http: Http::connect(host, port, headers)?,
+            http: Http::connect(host, port, headers, timeout)?,
             index: index.to_string(),
         })
     }
@@ -188,32 +196,55 @@ impl Es {
 
     /// Open a point-in-time over the index; the walk reads through this
     /// consistent snapshot. Each search refreshes `keep_alive`, so a slow
-    /// insert loop cannot let it lapse mid-run.
+    /// insert loop cannot let it lapse mid-run. One retry: opening a PIT
+    /// is idempotent (an abandoned one just expires), and this call
+    /// happens once per range under load.
     pub fn open_pit(&mut self, keep_alive: &str) -> Result<String, String> {
         let path = format!(
             "/{}/_pit?keep_alive={}",
             percent_encode(&self.index),
             percent_encode(keep_alive)
         );
-        let (code, body) = self
-            .http
-            .request("POST", &path, "application/json", b"")
-            .map_err(|e| format!("point-in-time request failed: {e}"))?;
-        if code != 200 {
-            return Err(format!("PIT request returned HTTP {code}: {}", head(&body)));
+        for attempt in 0..=1 {
+            match self.http.request("POST", &path, "application/json", b"") {
+                Ok((200, body)) => {
+                    let parsed = json::parse(&body)?;
+                    return parsed
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("PIT response missing `id`: {}", head(&body)));
+                }
+                Ok((code, _body)) if attempt == 0 => {
+                    eprintln!("point-in-time request returned HTTP {code} — retrying once");
+                }
+                Ok((code, body)) => {
+                    return Err(format!("PIT request returned HTTP {code}: {}", head(&body)))
+                }
+                Err(e) if attempt == 0 => {
+                    eprintln!("point-in-time request failed ({e}) — retrying once");
+                }
+                Err(e) => return Err(format!("point-in-time request failed: {e}")),
+            }
+            thread::sleep(Duration::from_secs(5));
         }
-        let parsed = json::parse(&body)?;
-        parsed
-            .get("id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .ok_or_else(|| format!("PIT response missing `id`: {}", head(&body)))
+        unreachable!("the loop returns on every path")
     }
+
+    /// Backoff schedule for one page fetch, after the per-request
+    /// timeout fired or the cluster answered 5xx/429. A search is
+    /// read-only and idempotent, so a stalled shard or a GC pause is
+    /// ridden out (up to ~40 s of sleeps beyond the timeouts) instead of
+    /// failing the run; each successful fetch also re-arms the PIT's
+    /// `keep_alive`, so the gaps stay well inside it.
+    const RETRY_BACKOFF_SECS: [u64; 3] = [2, 10, 30];
 
     /// Fetch the next page: `size` hits continuing at `after` (the raw
     /// `search_after` array text; `None` starts the walk). `filter` is a
     /// raw JSON query object (`{"range":{"@timestamp":...}}`) that scopes
-    /// this walk to one worker's time range.
+    /// this walk to one worker's time range. Transport failures and
+    /// 5xx/429 answers are retried per [`Self::RETRY_BACKOFF_SECS`];
+    /// other HTTP codes fail immediately (they would just repeat).
     pub fn search_page(
         &mut self,
         pit: &str,
@@ -222,8 +253,18 @@ impl Es {
         after: Option<&str>,
         filter: Option<&str>,
     ) -> Result<Page, String> {
+        // `track_total_hits: true` is exact and therefore costs a full
+        // traversal of the range query — only the first page of a fresh
+        // walk pays it (for the header/ETA). Later pages use the default
+        // capped counting, which rides along with the page fetch itself;
+        // their `total` values are `gte`-relation noise and ignored.
+        let total_clause = if after.is_none() {
+            r#""track_total_hits":true,"#
+        } else {
+            ""
+        };
         let mut body = format!(
-            r#"{{"size":{size},"track_total_hits":true,"pit":{{"id":{},"keep_alive":{}}},"sort":[{{"@timestamp":"asc"}},{{"_shard_doc":"asc"}}]"#,
+            r#"{{"size":{size},{total_clause}"pit":{{"id":{},"keep_alive":{}}},"sort":[{{"@timestamp":"asc"}},{{"_shard_doc":"asc"}}]"#,
             json::Json::Str(pit.to_string()).to_compact(),
             json::Json::Str(keep_alive.to_string()).to_compact(),
         );
@@ -237,14 +278,41 @@ impl Es {
         }
         body.push('}');
 
-        let (code, resp) = self
-            .http
-            .request("POST", "/_search", "application/json", body.as_bytes())
-            .map_err(|e| format!("search request failed: {e}"))?;
-        if code != 200 {
-            return Err(format!("search returned HTTP {code}: {}", head(&resp)));
+        let mut attempt: usize = 0;
+        loop {
+            match self
+                .http
+                .request("POST", "/_search", "application/json", body.as_bytes())
+            {
+                Ok((200, resp)) => return parse_page(&resp),
+                Ok((code, resp)) => {
+                    if (code >= 500 || code == 429) && attempt < Self::RETRY_BACKOFF_SECS.len() {
+                        let wait = Self::RETRY_BACKOFF_SECS[attempt];
+                        attempt += 1;
+                        eprintln!(
+                            "elasticsearch returned HTTP {code} — retrying in {wait}s (attempt {attempt}/{})",
+                            Self::RETRY_BACKOFF_SECS.len(),
+                        );
+                        thread::sleep(Duration::from_secs(wait));
+                        continue;
+                    }
+                    return Err(format!("search returned HTTP {code}: {}", head(&resp)));
+                }
+                Err(e) => {
+                    if attempt < Self::RETRY_BACKOFF_SECS.len() {
+                        let wait = Self::RETRY_BACKOFF_SECS[attempt];
+                        attempt += 1;
+                        eprintln!(
+                            "elasticsearch connection failed ({e}) — retrying in {wait}s (attempt {attempt}/{})",
+                            Self::RETRY_BACKOFF_SECS.len(),
+                        );
+                        thread::sleep(Duration::from_secs(wait));
+                        continue;
+                    }
+                    return Err(format!("search request failed: {e}"));
+                }
+            }
         }
-        parse_page(&resp)
     }
 
     /// Release the point-in-time. Best effort: a failed close only costs
@@ -257,8 +325,8 @@ impl Es {
     }
 }
 
-/// Extract `hits.total.value` and the per-hit (`_id`, `_source`, `sort`)
-/// triples from one search response.
+/// Extract `hits.total.value` (when present) and the per-hit
+/// (`_id`, `_source`, `sort`) triples from one search response.
 fn parse_page(resp: &str) -> Result<Page, String> {
     let parsed = json::parse(resp)?;
     let hits_node = parsed
@@ -269,8 +337,7 @@ fn parse_page(resp: &str) -> Result<Page, String> {
         .get("total")
         .and_then(|t| t.get("value"))
         .and_then(|v| v.as_num_text())
-        .and_then(|t| t.parse().ok())
-        .ok_or_else(|| format!("search response missing `hits.total.value`: {}", head(resp)))?;
+        .and_then(|t| t.parse::<u64>().ok());
 
     let Json::Arr(items) = hits_node
         .get("hits")
@@ -325,7 +392,7 @@ mod tests {
              "_source":{"@timestamp":"2023-08-22T13:30:00.123999999Z","msg_type_id":102},
              "sort":[1692711000123,43]}]}}"#;
         let page = parse_page(resp).unwrap();
-        assert_eq!(page.total, 61_668_134);
+        assert_eq!(page.total, Some(61_668_134));
         assert_eq!(page.hits.len(), 2);
         assert_eq!(page.hits[0].id, "a:9:0");
         assert_eq!(page.hits[0].ts_text, "1692711000123");
@@ -344,10 +411,22 @@ mod tests {
     #[test]
     fn malformed_pages_are_errors() {
         assert!(parse_page(r#"{"error":"boom"}"#).is_err());
-        assert!(parse_page(r#"{"hits":{"hits":[]}}"#).is_err()); // no total
+        assert!(parse_page(r#"{"hits":{"hits":[]}}"#).is_ok()); // total optional now
         assert!(parse_page(
             r#"{"hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_source":{}}]}}"#
         )
         .is_err()); // no _id
+    }
+
+    #[test]
+    fn capped_total_counts_as_none() {
+        // Later pages use the default capped counting: the value is
+        // `gte`-relation noise the walk ignores.
+        let page = parse_page(
+            r#"{"hits":{"total":{"value":10000,"relation":"gte"},"hits":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(page.total, Some(10_000));
+        assert!(page.hits.is_empty());
     }
 }
